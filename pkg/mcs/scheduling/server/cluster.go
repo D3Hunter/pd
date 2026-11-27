@@ -96,7 +96,7 @@ type Cluster struct {
 	keyspaceCache     *keyspace.Cache
 	coordinator       *schedule.Coordinator
 	checkMembershipCh chan struct{}
-	pdLeader          atomic.Value
+	pdLeader          atomic.Pointer[pdLeaderClient]
 	running           atomic.Bool
 
 	backendAddress string
@@ -108,6 +108,11 @@ type Cluster struct {
 	miscRunner ratelimit.Runner
 	// logRunner is used to process the log asynchronously.
 	logRunner ratelimit.Runner
+}
+
+type pdLeaderClient struct {
+	client pdpb.PDClient
+	url    string
 }
 
 const (
@@ -173,6 +178,8 @@ func NewCluster(
 		miscRunner:      ratelimit.NewConcurrentRunner(miscTaskRunner, ratelimit.NewConcurrencyLimiter(uint64(runtime.NumCPU()*2)), time.Minute),
 		logRunner:       ratelimit.NewConcurrentRunner(logTaskRunner, ratelimit.NewConcurrencyLimiter(uint64(runtime.NumCPU()*2)), time.Minute),
 	}
+	// PD stores the affinity targets this service decides, like all other affinity metadata.
+	affinityManager.SetTargetWriter(mcsaffinity.NewTargetWriter(httpClient, c.getPDLeaderURL, c.triggerMembershipCheck))
 
 	c.coordinator = schedule.NewCoordinator(ctx, c, hbStreams)
 	err = c.ruleManager.Initialize(persistConfig.GetMaxReplicas(), persistConfig.GetLocationLabels(), persistConfig.GetIsolationLevel(), true)
@@ -451,7 +458,15 @@ func (c *Cluster) getPDLeaderClient() (pdpb.PDClient, error) {
 		c.triggerMembershipCheck()
 		return nil, errors.New("PD leader is not found")
 	}
-	return cli.(pdpb.PDClient), nil
+	return cli.client, nil
+}
+
+func (c *Cluster) getPDLeaderURL() (string, error) {
+	leader := c.pdLeader.Load()
+	if leader == nil || leader.url == "" {
+		return "", errors.New("PD leader is not found")
+	}
+	return leader.url, nil
 }
 
 func (c *Cluster) triggerMembershipCheck() {
@@ -461,10 +476,10 @@ func (c *Cluster) triggerMembershipCheck() {
 	}
 }
 
-// SwitchPDLeader switches the PD leader.
-func (c *Cluster) SwitchPDLeader(new pdpb.PDClient) bool {
+// SwitchPDLeader switches the PD leader's gRPC client and HTTP URL together.
+func (c *Cluster) SwitchPDLeader(new pdpb.PDClient, clientURL string) bool {
 	old := c.pdLeader.Load()
-	return c.pdLeader.CompareAndSwap(old, new)
+	return c.pdLeader.CompareAndSwap(old, &pdLeaderClient{client: new, url: clientURL})
 }
 
 func trySend(notifier chan struct{}) {
@@ -482,22 +497,26 @@ func (c *Cluster) updateScheduler() {
 
 	// Make sure the coordinator has initialized all the existing schedulers.
 	c.waitSchedulersInitialized()
-	// Establish a notifier to listen the schedulers updating.
-	notifier := make(chan struct{}, 1)
+	// Config changes reconcile both additions and removals. A completed
+	// removal only needs to retry additions that a reserved name blocked.
+	configChanged := make(chan struct{}, 1)
+	removalCompleted := make(chan struct{}, 1)
 	// Make sure the check will be triggered once later.
-	trySend(notifier)
-	c.persistConfig.SetSchedulersUpdatingNotifier(notifier)
-	defer c.persistConfig.ClearSchedulersUpdatingNotifier(notifier)
+	trySend(configChanged)
+	c.persistConfig.SetSchedulersUpdatingNotifier(configChanged)
+	defer c.persistConfig.ClearSchedulersUpdatingNotifier(configChanged)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
+		checkRemovals := false
 		select {
 		case <-c.ctx.Done():
 			log.Info("cluster is closing, stop listening the schedulers updating notifier")
 			return
-		case <-notifier:
-			// This is triggered by the watcher when the schedulers are updated.
+		case <-configChanged:
+			checkRemovals = true
+		case <-removalCompleted:
 		}
 
 		if !c.running.Load() {
@@ -507,7 +526,7 @@ func (c *Cluster) updateScheduler() {
 				return
 			case <-ticker.C:
 				// retry
-				trySend(notifier)
+				trySend(configChanged)
 				continue
 			}
 		}
@@ -560,9 +579,15 @@ func (c *Cluster) updateScheduler() {
 				zap.String("scheduler-name", name),
 				zap.Strings("scheduler-args", scheduler.Args))
 		}
+		if !checkRemovals {
+			continue
+		}
 		// Remove the deleted schedulers or disabled schedulers.
 		for _, name := range schedulersController.GetSchedulerNames() {
 			scheduler := schedulersController.GetScheduler(name)
+			if scheduler == nil {
+				continue
+			}
 			oldType := types.SchedulerTypeCompatibleMap[scheduler.GetType()]
 			shouldKeep := slice.AnyOf(latestSchedulersConfig, func(i int) bool {
 				return latestSchedulersConfig[i].Type == oldType && !latestSchedulersConfig[i].Disable
@@ -570,14 +595,12 @@ func (c *Cluster) updateScheduler() {
 			if shouldKeep {
 				continue
 			}
-			if err := schedulersController.RemoveScheduler(name); err != nil {
-				log.Error("failed to remove scheduler",
+			if err := schedulersController.StartRemoveScheduler(scheduler, removalCompleted); err != nil &&
+				!errs.ErrSchedulerNotFound.Equal(err) {
+				log.Error("failed to start scheduler removal",
 					zap.String("scheduler-name", name),
 					errs.ZapError(err))
-				continue
 			}
-			log.Info("remove scheduler successfully",
-				zap.String("scheduler-name", name))
 		}
 	}
 }
@@ -852,6 +875,9 @@ func (c *Cluster) StopBackgroundJobs() {
 	c.miscRunner.Stop()
 	c.logRunner.Stop()
 	c.wg.Wait()
+	// The config loop can start a removal after the coordinator stops waiting
+	// for scheduler loops. Join those removals once the config loop has exited.
+	c.coordinator.GetSchedulersController().WaitForRemovals()
 }
 
 // IsBackgroundJobsRunning returns whether the background jobs are running. Only for test purpose.
